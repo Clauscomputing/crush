@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -236,6 +237,184 @@ func (s *Shell) blockHandler() func(next interp.ExecHandlerFunc) interp.ExecHand
 	}
 }
 
+// shHandler intercepts execution of sh/bash and runs them in-process
+// to ensure they stay within the application's security sandbox.
+func (s *Shell) shHandler() func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+	return func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+		return func(ctx context.Context, args []string) error {
+			if len(args) == 0 {
+				return next(ctx, args)
+			}
+
+			cmd := filepath.Base(args[0])
+			if cmd == "sh" || cmd == "bash" {
+				var scriptFile string
+				var scriptContent string
+				var params []string
+
+				// Naive argument parsing for -c or script file
+				for i := 1; i < len(args); i++ {
+					if args[i] == "-c" {
+						if i+1 < len(args) {
+							scriptContent = args[i+1]
+							// args for -c command start after the content string
+							if i+2 < len(args) {
+								params = args[i+2:]
+							}
+							break
+						}
+						return fmt.Errorf("%s: -c requires an argument", cmd)
+					}
+					// Stop at first non-flag argument (the script file)
+					if !strings.HasPrefix(args[i], "-") {
+						scriptFile = args[i]
+						// args including scriptFile and subsequent args are params
+						params = args[i:]
+						break
+					}
+				}
+
+				hc := interp.HandlerCtx(ctx)
+				env := hc.Env
+				stdout := hc.Stdout
+				stderr := hc.Stderr
+				cwd := hc.Dir
+
+				if scriptContent != "" {
+					return s.runScript(ctx, scriptContent, params, env, cwd, stdout, stderr)
+				}
+
+				if scriptFile != "" {
+					content, err := os.ReadFile(scriptFile)
+					if err != nil {
+						return err
+					}
+					return s.runScript(ctx, string(content), params, env, cwd, stdout, stderr)
+				}
+
+				return fmt.Errorf("%s: interactive mode not supported", cmd)
+			}
+
+			return next(ctx, args)
+		}
+	}
+}
+
+// scriptExecutionHandler checks if the command being executed is a shell script
+// and if so, runs it in-process to ensure sandbox safety.
+func (s *Shell) scriptExecutionHandler() func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+	return func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+		return func(ctx context.Context, args []string) error {
+			if len(args) == 0 {
+				return next(ctx, args)
+			}
+
+			// Skip explicit "sh" and "bash" commands (handled by shHandler)
+			base := filepath.Base(args[0])
+			if base == "sh" || base == "bash" {
+				return next(ctx, args)
+			}
+
+			path := args[0]
+			hc := interp.HandlerCtx(ctx)
+
+			// Resolve path if it's not absolute or relative (simple name like "script.sh")
+			if !strings.Contains(path, string(os.PathSeparator)) {
+				pathEnv := ""
+				hc.Env.Each(func(k string, v expand.Variable) bool {
+					if k == "PATH" {
+						pathEnv = v.Str
+						return false
+					}
+					return true
+				})
+
+				if found, err := lookPath(path, pathEnv); err == nil {
+					path = found
+				} else {
+					// Can't resolve, let next handler deal with it (likely fail)
+					return next(ctx, args)
+				}
+			}
+
+			// Check if it's a shell script
+			if isShellScript(path) {
+				content, err := os.ReadFile(path)
+				if err != nil {
+					return err
+				}
+
+				// Run in-process. args are passed as params ($0, $1, ...).
+				return s.runScript(ctx, string(content), args, hc.Env, hc.Dir, hc.Stdout, hc.Stderr)
+			}
+
+			return next(ctx, args)
+		}
+	}
+}
+
+func isShellScript(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	buf := make([]byte, 128)
+	n, err := f.Read(buf)
+	if err != nil && err != io.EOF {
+		return false
+	}
+	header := string(buf[:n])
+
+	// Check for standard shebangs
+	return strings.HasPrefix(header, "#!") &&
+		(strings.Contains(header, "/bin/sh") ||
+			strings.Contains(header, "/bin/bash") ||
+			strings.Contains(header, " env sh") ||
+			strings.Contains(header, " env bash"))
+}
+
+func lookPath(file string, pathEnv string) (string, error) {
+	if pathEnv == "" {
+		return "", os.ErrNotExist
+	}
+	for _, dir := range filepath.SplitList(pathEnv) {
+		if dir == "" {
+			dir = "."
+		}
+		path := filepath.Join(dir, file)
+		if info, err := os.Stat(path); err == nil {
+			if !info.IsDir() && info.Mode()&0111 != 0 {
+				return path, nil
+			}
+		}
+	}
+	return "", os.ErrNotExist
+}
+
+// runScript runs a shell command/script in a new in-process runner
+func (s *Shell) runScript(ctx context.Context, content string, params []string, env expand.Environ, dir string, stdout, stderr io.Writer) error {
+	line, err := syntax.NewParser().Parse(strings.NewReader(content), "")
+	if err != nil {
+		return fmt.Errorf("could not parse script: %w", err)
+	}
+
+	runner, err := interp.New(
+		interp.StdIO(nil, stdout, stderr),
+		interp.Interactive(false),
+		interp.Env(env),
+		interp.Dir(dir),
+		interp.Params(params...),
+		interp.ExecHandlers(s.execHandlers()...),
+	)
+	if err != nil {
+		return fmt.Errorf("could not run command: %w", err)
+	}
+
+	return runner.Run(ctx, line)
+}
+
 // newInterp creates a new interpreter with the current shell state
 func (s *Shell) newInterp(stdout, stderr io.Writer) (*interp.Runner, error) {
 	return interp.New(
@@ -290,7 +469,10 @@ func (s *Shell) execHandlers() []func(next interp.ExecHandlerFunc) interp.ExecHa
 	handlers := []func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc{
 		s.blockHandler(),
 	}
+	// Always enable safety handlers on OpenBSD, but acceptable everywhere
 	if useGoCoreUtils {
+		handlers = append(handlers, s.shHandler())
+		handlers = append(handlers, s.scriptExecutionHandler())
 		handlers = append(handlers, coreutils.ExecHandler)
 	}
 	return handlers

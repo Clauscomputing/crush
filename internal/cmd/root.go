@@ -20,6 +20,7 @@ import (
 	"github.com/charmbracelet/crush/internal/db"
 	"github.com/charmbracelet/crush/internal/event"
 	"github.com/charmbracelet/crush/internal/projects"
+	"github.com/charmbracelet/crush/internal/security"
 	"github.com/charmbracelet/crush/internal/stringext"
 	"github.com/charmbracelet/crush/internal/tui"
 	"github.com/charmbracelet/crush/internal/version"
@@ -190,6 +191,13 @@ func setupApp(cmd *cobra.Command) (*app.App, error) {
 	cfg, err := config.Init(cwd, dataDir, debug)
 	if err != nil {
 		return nil, err
+	}
+
+	// Initialize security sandboxing after config is loaded but before DB connection.
+	// This sets up pledge/unveil on OpenBSD with all paths needed for the application.
+	if err := security.Init(cfg.Options.DataDirectory, cwd); err != nil {
+		slog.Error("Failed to initialize OpenBSD security", "error", err)
+		return nil, fmt.Errorf("security initialization failed: %w", err)
 	}
 
 	if cfg.Permissions == nil {
