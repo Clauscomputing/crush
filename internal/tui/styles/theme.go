@@ -185,7 +185,7 @@ func (t *Theme) buildStyles() *Styles {
 				Suggestion:  base.Foreground(t.FgSubtle),
 			},
 			Cursor: textinput.CursorStyle{
-				Color: t.Secondary,
+				Color: t.FgBase,
 				Shape: tea.CursorBlock,
 				Blink: true,
 			},
@@ -210,7 +210,7 @@ func (t *Theme) buildStyles() *Styles {
 				Prompt:           base.Foreground(t.FgMuted),
 			},
 			Cursor: textarea.CursorStyle{
-				Color: t.Secondary,
+				Color: t.FgBase,
 				Shape: tea.CursorBlock,
 				Blink: true,
 			},
@@ -320,7 +320,7 @@ func (t *Theme) buildStyles() *Styles {
 				StylePrimitive: ansi.StylePrimitive{
 					Prefix:          " ",
 					Suffix:          " ",
-					Color:           stringPtr(charmtone.Coral.Hex()),
+					Color:           stringPtr("#91ddff"),
 					BackgroundColor: stringPtr(charmtone.Charcoal.Hex()),
 				},
 			},
@@ -525,9 +525,11 @@ func NewManager() *Manager {
 		themes: make(map[string]*Theme),
 	}
 
-	t := NewCharmtoneTheme() // default theme
+	t := NewChallengerDeepTheme() // default theme
 	m.Register(t)
 	m.current = m.themes[t.Name]
+
+	m.Register(NewCharmtoneTheme())
 
 	return m
 }

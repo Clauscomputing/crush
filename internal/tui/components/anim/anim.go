@@ -52,7 +52,7 @@ var (
 )
 
 var (
-	availableRunes = []rune("0123456789abcdefABCDEF~!@#$£€%^&*()+=_")
+	availableRunes = []rune("█")
 	ellipsisFrames = []string{".", "..", "...", ""}
 )
 
